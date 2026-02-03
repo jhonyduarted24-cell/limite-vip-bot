@@ -82,11 +82,6 @@ async def on_join(update, context):
     db.execute("INSERT OR REPLACE INTO join_requests VALUES (?,1)", (user_id,))
     db.commit()
 
-@bot.post_init
-async def init(app_):
-    app_.add_handler(CommandHandler("start", start))
-    app_.add_handler(CallbackQueryHandler(buy))
-    app_.add_handler(ChatJoinRequestHandler(on_join))
 
 @app.post("/mp/webhook")
 async def mp_webhook(req: Request):
