@@ -74,19 +74,30 @@ app = FastAPI()
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
 # -------- Mercado Pago helpers --------
-async def mp_create_pix(order_id: str, user_id: int) -> dict:
+async def mp_create_pix(order_id: str, user_id: int, amount: float, desc: str) -> dict:
     url = "https://api.mercadopago.com/v1/payments"
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
     payload = {
-        "transaction_amount": PRICE,
-        "description": DESCRIPTION,
+        "transaction_amount": round(float(amount), 2),
+        "description": desc,
         "payment_method_id": "pix",
         "payer": {"email": f"user{user_id}@bot.local"},
         "external_reference": order_id,
     }
+
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
+
+        # ✅ Mostra o erro real no Render Logs
+        if r.status_code >= 400:
+            print("MP_CREATE_PIX_ERROR_STATUS:", r.status_code)
+            print("MP_CREATE_PIX_ERROR_BODY:", r.text)
+            raise Exception(f"MercadoPago error {r.status_code}")
+
         data = r.json()
 
     tx = data.get("point_of_interaction", {}).get("transaction_data", {})
@@ -96,13 +107,6 @@ async def mp_create_pix(order_id: str, user_id: int) -> dict:
         "qr_code": tx.get("qr_code"),
     }
 
-async def mp_get_payment(payment_id: str) -> dict:
-    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, headers=headers)
-        r.raise_for_status()
-        return r.json()
 
 # -------- Telegram handlers --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
