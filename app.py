@@ -125,4 +125,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔞 *Canal VIP*\n\nClique abaixo para gerar o PIX.",
         reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdow_
+        parse_mode="Markdown",
+    )
+
