@@ -119,7 +119,7 @@ async def mp_create_pix_payment(amount: float, user_id: int, plan_key: str) -> D
         "transaction_amount": float(amount),
         "description": f"{BRAND_NAME} - {plan_key} - user {user_id}",
         "payment_method_id": "pix",
-        "payer": {"email": f"user{user_id}@telegram.local"},
+        "payer": {"email": f"user{user_id}@example.com"},
         "metadata": {"telegram_user_id": user_id, "plan_key": plan_key},
     }
     if notification_url:
