@@ -24,7 +24,7 @@ from telegram.ext import (
 # ==========================
 # Planos (você pode mudar nomes/valores aqui quando quiser)
 PLANS: List[Dict[str, Any]] = [
-    {"id": "vip_7", "name": "🥉 VIP 7 dias", "price": 19.90},
+    {"id": "vip_7", "name": "🥉 VIP 7 dias", "price": 00.90},
     {"id": "vip_30", "name": "🥇 VIP 30 dias", "price": 49.90},
     {"id": "vip_90", "name": "💎 VIP 90 dias", "price": 99.90},
 ]
