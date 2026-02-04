@@ -8,64 +8,90 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 VIP_LINK = os.getenv("VIP_LINK")
 
-PLANO_NOME = "VIP 7 dias"
-PLANO_VALOR = 9.90  # valor REAL, não use centavos muito baixos
-PLANO_DESCRICAO = "Acesso VIP por 7 dias"
+VALOR = 1.00  # R$ 1,00 FIXO
 
-MP_URL = "https://api.mercadopago.com/v1/payments"
-
+# ---------- START ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("💳 Comprar VIP – R$ 9,90", callback_data="buy")]
+        [InlineKeyboardButton("💳 Comprar VIP por R$ 1,00", callback_data="pagar")]
     ]
     await update.message.reply_text(
-        "👑 *Plano VIP*\n\nAcesso por 7 dias.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        "👋 Bem-vindo!\n\n🎟️ Acesso VIP disponível por apenas *R$ 1,00*.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- CRIAR PIX ----------
+def criar_pix():
+    url = "https://api.mercadopago.com/v1/payments"
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "X-Idempotency-Key": str(uuid.uuid4())
+    }
+
+    data = {
+        "transaction_amount": VALOR,
+        "description": "Acesso VIP Telegram",
+        "payment_method_id": "pix",
+        "payer": {
+            "email": f"cliente_{uuid.uuid4()}@botvip.com"
+        }
+    }
+
+    response = requests.post(url, json=data, headers=headers, timeout=20)
+
+    if response.status_code != 201:
+        raise Exception(response.text)
+
+    pix_data = response.json()
+    copia_e_cola = pix_data["point_of_interaction"]["transaction_data"]["qr_code"]
+
+    return copia_e_cola
+
+# ---------- BOTÃO PAGAR ----------
+async def pagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     try:
-        pix_data = {
-            "transaction_amount": PLANO_VALOR,
-            "description": PLANO_DESCRICAO,
-            "payment_method_id": "pix",
-            "payer": {
-                "email": f"user_{query.from_user.id}@telegram.com"
-            }
-        }
+        codigo_pix = criar_pix()
 
-        headers = {
-            "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-            "X-Idempotency-Key": str(uuid.uuid4())
-        }
-
-        r = requests.post(MP_URL, json=pix_data, headers=headers, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-
-        copia_cola = data["point_of_interaction"]["transaction_data"]["qr_code"]
+        keyboard = [
+            [InlineKeyboardButton("✅ Já paguei", callback_data="confirmar")]
+        ]
 
         await query.message.reply_text(
-            f"✅ *PIX gerado!*\n\n"
-            f"📦 Plano: {PLANO_NOME}\n"
-            f"💰 Valor: R$ {PLANO_VALOR}\n\n"
-            f"🔑 *Copia e cola PIX:*\n`{copia_cola}`\n\n"
-            f"Após pagar, você receberá acesso manualmente.",
-            parse_mode="Markdown"
+            f"💰 *PIX gerado com sucesso!*\n\n"
+            f"💵 Valor: *R$ 1,00*\n\n"
+            f"📋 *Copia e Cola (PIX):*\n"
+            f"`{codigo_pix}`\n\n"
+            f"Após o pagamento, clique em *Já paguei*.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
     except Exception as e:
-        await query.message.reply_text(f"❌ Erro ao gerar PIX.\n\n{e}")
+        await query.message.reply_text(f"❌ Erro ao gerar PIX:\n{e}")
 
+# ---------- CONFIRMAR ----------
+async def confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.message.reply_text(
+        f"✅ Pagamento confirmado!\n\n"
+        f"🔓 Aqui está seu acesso VIP:\n{VIP_LINK}"
+    )
+
+# ---------- MAIN ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(buy, pattern="buy"))
+    app.add_handler(CallbackQueryHandler(pagar, pattern="pagar"))
+    app.add_handler(CallbackQueryHandler(confirmar, pattern="confirmar"))
+
     app.run_polling()
 
 if __name__ == "__main__":
