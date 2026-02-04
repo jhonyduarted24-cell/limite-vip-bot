@@ -146,8 +146,7 @@ async def mp_create_pix_payment(amount: float, user_id: int, plan_key: str) -> D
         "transaction_amount": float(amount),
         "description": f"{BRAND_NAME} - {plan_key} - user {user_id}",
         "payment_method_id": "pix",
-        "currency_id": CURRENCY,
-        "payer": {"email": PAYER_EMAIL},  # precisa ser válido
+        "payer": {"email": PAYER_EMAIL},  # email válido
         "metadata": {"telegram_user_id": user_id, "plan_key": plan_key},
     }
     if notification_url:
@@ -162,14 +161,12 @@ async def mp_create_pix_payment(amount: float, user_id: int, plan_key: str) -> D
         )
 
     if r.status_code >= 400:
-        # log real do MP (pra você nunca mais ficar no escuro)
         log.error("MP CREATE ERROR %s -> %s", r.status_code, r.text)
         raise RuntimeError(f"MP ERROR {r.status_code} -> {r.text}")
 
     data = r.json()
     tx = (data.get("point_of_interaction") or {}).get("transaction_data") or {}
     qr_code = tx.get("qr_code")
-
     if not qr_code:
         log.error("MP SEM QR_CODE -> %s", json.dumps(data, ensure_ascii=False))
         raise RuntimeError(f"MP SEM QR_CODE -> {data}")
@@ -180,6 +177,7 @@ async def mp_create_pix_payment(amount: float, user_id: int, plan_key: str) -> D
         "qr_code": qr_code,
         "qr_code_base64": tx.get("qr_code_base64"),
     }
+
 
 async def mp_get_payment_status(payment_id: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
