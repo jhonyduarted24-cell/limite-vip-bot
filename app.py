@@ -135,37 +135,39 @@ def get_plan(plan_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def mp_create_pix(order_id: str, user_id: int, plan: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Cria um pagamento PIX no Mercado Pago.
-    Retorna json do MP (ou levanta erro).
-    """
-    url = "https://api.mercadopago.com/v1/payments"
+    # PIX EMV (aceito por bancos)
+    url = "https://api.mercadopago.com/instore/orders/qr/seller/collectors/me/pos/TelegramPOS/qrs"
+
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Content-Type": "application/json",
-        # ✅ Corrige o erro: nunca pode ser null
         "X-Idempotency-Key": order_id,
     }
 
     payload = {
-        "transaction_amount": float(plan["price"]),
-        "description": f"{plan['name']} - Pedido {order_id}",
-        "payment_method_id": "pix",
-        "payer": {
-            # Mercado Pago aceita email "fake" em muitos casos, mas se sua conta exigir, troque por um válido.
-            "email": f"user{user_id}@example.com",
-        },
         "external_reference": order_id,
+        "title": plan["name"],
+        "description": f"{plan['name']} - Telegram",
+        "total_amount": float(plan["price"]),
+        "items": [
+            {
+                "title": plan["name"],
+                "description": "Acesso VIP Telegram",
+                "quantity": 1,
+                "unit_price": float(plan["price"]),
+            }
+        ],
+        "notification_url": "",  # pode deixar vazio por enquanto
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=payload)
+        r = await client.put(url, headers=headers, json=payload)
 
-    # Mostra erro real
     if r.status_code not in (200, 201):
         raise RuntimeError(f"MP_ERROR {r.status_code}: {r.text}")
 
     return r.json()
+
 
 
 async def mp_get_payment(payment_id: str) -> Dict[str, Any]:
@@ -181,23 +183,12 @@ async def mp_get_payment(payment_id: str) -> Dict[str, Any]:
 
 
 def mp_extract_pix_info(mp_json: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Tenta extrair QR e copia/cola.
-    """
-    poi = mp_json.get("point_of_interaction", {}) or {}
-    tx = poi.get("transaction_data", {}) or {}
+    # Aqui o MP devolve o "copia e cola" EMV (QR válido)
+    qr_data = mp_json.get("qr_data")
+    if not qr_data:
+        raise RuntimeError(f"MP_RETURN_NO_QR_DATA: {mp_json}")
+    return {"qr_code": qr_data, "qr_code_base64": ""}
 
-    qr_code = tx.get("qr_code")
-    qr_code_base64 = tx.get("qr_code_base64")
-
-    # Alguns retornos podem usar outros campos
-    if not qr_code:
-        raise RuntimeError(f"MP_RETURN_NO_QR: {mp_json}")
-
-    return {
-        "qr_code": qr_code,
-        "qr_code_base64": qr_code_base64 or "",
-    }
 
 
 # ==========================
