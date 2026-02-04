@@ -145,12 +145,13 @@ async def mp_webhook(req: Request):
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(bot.initialize())
-    asyncio.create_task(bot.start())
-    asyncio.create_task(bot.updater.start_polling())
+    await bot.initialize()
+    await bot.start()
+    await bot.updater.start_polling(drop_pending_updates=True)
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await bot.updater.stop()
     await bot.stop()
     await bot.shutdown()
+
