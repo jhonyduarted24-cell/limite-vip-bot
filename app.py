@@ -108,18 +108,11 @@ LAST_PAYMENT_BY_USER: Dict[int, str] = {}
 MP_API = "https://api.mercadopago.com"
 
 async def mp_create_pix_payment(amount: float, user_id: int, plan_key: str) -> Dict[str, Any]:
-    """
-    Cria pagamento PIX (Mercado Pago) e retorna:
-    - id (payment_id)
-    - qr_code (copia e cola)
-    - qr_code_base64 (se quiser usar depois)
-    """
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
 
-    # webhook opcional: se PUBLIC_BASE_URL existir, MP chama aqui quando mudar status
     notification_url = f"{PUBLIC_BASE_URL}/mp/webhook" if PUBLIC_BASE_URL else None
 
     payload = {
@@ -133,24 +126,26 @@ async def mp_create_pix_payment(amount: float, user_id: int, plan_key: str) -> D
         payload["notification_url"] = notification_url
 
     async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.post(f"{MP_API}/v1/payments", headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
+        r = await client.post("https://api.mercadopago.com/v1/payments", headers=headers, json=payload)
+
+    if r.status_code >= 400:
+        # ISSO AQUI VAI TE MOSTRAR O MOTIVO REAL NO LOG DO RAILWAY
+        raise RuntimeError(f"MP ERROR {r.status_code} -> {r.text}")
+
+    data = r.json()
 
     tx = (data.get("point_of_interaction", {}) or {}).get("transaction_data", {}) or {}
     qr_code = tx.get("qr_code")
-    qr_b64 = tx.get("qr_code_base64")
-
     if not qr_code:
-        # Às vezes o MP pode responder sem o qr_code se algo estiver faltando
-        raise RuntimeError(f"Mercado Pago não retornou qr_code. Resposta: {data}")
+        raise RuntimeError(f"MP SEM QR_CODE -> {data}")
 
     return {
         "payment_id": str(data.get("id")),
-        "status": data.get("status"),
+        "status": str(data.get("status")),
         "qr_code": qr_code,
-        "qr_code_base64": qr_b64,
+        "qr_code_base64": tx.get("qr_code_base64"),
     }
+
 
 
 async def mp_get_payment_status(payment_id: str) -> str:
