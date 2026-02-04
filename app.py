@@ -40,7 +40,7 @@ DB_PATH = "db.sqlite"
 # 3 PLANOS (edite aqui)
 # =========================
 PLANS = {
-    "p1": {"name": "VIP 7 dias", "days": 7, "price": 9.90},
+    "p1": {"name": "VIP 7 dias", "days": 7, "price": 0.90},
     "p2": {"name": "VIP 30 dias", "days": 30, "price": 24.90},
     "p3": {"name": "VIP 90 dias", "days": 90, "price": 59.90},
 }
