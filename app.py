@@ -3,61 +3,75 @@ import time
 import json
 import uuid
 import sqlite3
-from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 import httpx
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
     ChatJoinRequestHandler,
+    ContextTypes,
 )
 
 # =========================
-# Config (edite só aqui)
+# ENV (Railway Variables)
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
 VIP_LINK = os.getenv("VIP_LINK", "").strip()
 
-# 3 planos (mude nomes, dias e preços aqui)
+# Opcional: se você for usar aprovação automática de solicitação de entrada
+CANAL_ID_RAW = os.getenv("CANAL_ID", "").strip()
+CANAL_ID = int(CANAL_ID_RAW) if CANAL_ID_RAW else None
+
+if not BOT_TOKEN:
+    raise RuntimeError("Faltou BOT_TOKEN nas Variables do Railway.")
+if not MP_ACCESS_TOKEN:
+    raise RuntimeError("Faltou MP_ACCESS_TOKEN nas Variables do Railway.")
+if not VIP_LINK:
+    raise RuntimeError("Faltou VIP_LINK nas Variables do Railway.")
+
+MP_API_BASE = "https://api.mercadopago.com"
+DB_PATH = "db.sqlite"
+
+# =========================
+# 3 PLANOS (edite aqui)
+# =========================
 PLANS = {
-    "p1": {"name": "VIP 7 dias",  "days": 7,  "price": 9.90},
+    "p1": {"name": "VIP 7 dias", "days": 7, "price": 9.90},
     "p2": {"name": "VIP 30 dias", "days": 30, "price": 24.90},
     "p3": {"name": "VIP 90 dias", "days": 90, "price": 59.90},
 }
 
-MP_API_BASE = "https://api.mercadopago.com"  # NÃO use .com.ar/.com.br aqui
-DB_PATH = "db.sqlite"
-
 # =========================
-# DB
+# DB (SQLite)
 # =========================
-def db():
+def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS payments ("
-        "user_id INTEGER, plan_id TEXT, mp_payment_id INTEGER, "
-        "status TEXT, created_at INTEGER, expires_at INTEGER, "
+        "user_id INTEGER,"
+        "plan_id TEXT,"
+        "mp_payment_id INTEGER,"
+        "status TEXT,"
+        "created_at INTEGER,"
+        "expires_at INTEGER,"
         "PRIMARY KEY(user_id, mp_payment_id)"
         ")"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS last_pending ("
-        "user_id INTEGER PRIMARY KEY, mp_payment_id INTEGER, plan_id TEXT"
+        "user_id INTEGER PRIMARY KEY,"
+        "mp_payment_id INTEGER,"
+        "plan_id TEXT"
         ")"
     )
     conn.commit()
     return conn
 
-CONN = db()
+CONN = init_db()
 
 def set_last_pending(user_id: int, mp_payment_id: int, plan_id: str):
     CONN.execute(
@@ -75,24 +89,14 @@ def get_last_pending(user_id: int) -> Optional[Dict[str, Any]]:
         return None
     return {"mp_payment_id": int(row[0]), "plan_id": row[1]}
 
-def set_payment(user_id: int, plan_id: str, mp_payment_id: int, status: str, expires_at: int):
+def set_subscription_active(user_id: int, plan_id: str, mp_payment_id: int, days: int):
+    expires_at = int(time.time()) + days * 86400
     CONN.execute(
         "INSERT OR REPLACE INTO payments(user_id, plan_id, mp_payment_id, status, created_at, expires_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, plan_id, mp_payment_id, status, int(time.time()), expires_at),
+        (user_id, plan_id, mp_payment_id, "approved", int(time.time()), expires_at),
     )
     CONN.commit()
-
-def update_payment_status(user_id: int, mp_payment_id: int, status: str):
-    CONN.execute(
-        "UPDATE payments SET status=? WHERE user_id=? AND mp_payment_id=?",
-        (status, user_id, mp_payment_id),
-    )
-    CONN.commit()
-
-def set_subscription_active(user_id: int, plan_id: str, mp_payment_id: int, days: int):
-    expires_at = int(time.time()) + days * 86400
-    set_payment(user_id, plan_id, mp_payment_id, "approved", expires_at)
 
 def has_active_subscription(user_id: int) -> bool:
     now = int(time.time())
@@ -113,30 +117,23 @@ def subscription_expires_at(user_id: int) -> Optional[int]:
     return int(row[0])
 
 # =========================
-# Mercado Pago (PIX)
+# Mercado Pago
 # =========================
 async def mp_create_pix(plan_id: str, user_id: int) -> Dict[str, Any]:
-    """
-    Cria um pagamento PIX no Mercado Pago via /v1/payments.
-    Retorna: payment_id, qr_code, qr_base64
-    """
     plan = PLANS[plan_id]
     amount = float(plan["price"])
 
-    # Mercado Pago costuma exigir um payer com email.
-    fake_email = f"user{user_id}@example.com"
-
     payload = {
-        "transaction_amount": amount,
-        "description": f"{plan['name']}",
+        "transaction_amount": round(amount, 2),
+        "description": plan["name"],
         "payment_method_id": "pix",
-        "payer": {"email": fake_email},
+        "payer": {"email": f"user{user_id}@example.com"},
     }
 
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Content-Type": "application/json",
-        # ESTE header não pode ser nulo (se for, dá erro 400 como no seu print)
+        # ✅ nunca pode ser nulo
         "X-Idempotency-Key": str(uuid.uuid4()),
     }
 
@@ -147,15 +144,13 @@ async def mp_create_pix(plan_id: str, user_id: int) -> Dict[str, Any]:
             raise RuntimeError(f"MP_ERROR {r.status_code}: {json.dumps(data, ensure_ascii=False)}")
 
     mp_payment_id = int(data["id"])
-    tx = data.get("point_of_interaction", {}).get("transaction_data", {}) or {}
+    tx = (data.get("point_of_interaction") or {}).get("transaction_data") or {}
     qr_code = tx.get("qr_code")
-    qr_base64 = tx.get("qr_code_base64")
 
     if not qr_code:
-        # Sem qr_code geralmente significa token errado (test/prod), conta sem PIX, ou resposta incompleta
         raise RuntimeError(f"MP_ERROR: PIX não retornou qr_code. Resposta: {json.dumps(data, ensure_ascii=False)}")
 
-    return {"payment_id": mp_payment_id, "qr_code": qr_code, "qr_base64": qr_base64}
+    return {"payment_id": mp_payment_id, "qr_code": qr_code}
 
 async def mp_get_payment(payment_id: int) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
@@ -167,37 +162,28 @@ async def mp_get_payment(payment_id: int) -> Dict[str, Any]:
     return data
 
 # =========================
-# Telegram UI
+# Teclados
 # =========================
 def plans_keyboard() -> InlineKeyboardMarkup:
-    kb = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🟩 {PLANS['p1']['name']} — R$ {PLANS['p1']['price']:.2f}", callback_data="buy:p1")],
         [InlineKeyboardButton(f"🟨 {PLANS['p2']['name']} — R$ {PLANS['p2']['price']:.2f}", callback_data="buy:p2")],
         [InlineKeyboardButton(f"🟥 {PLANS['p3']['name']} — R$ {PLANS['p3']['price']:.2f}", callback_data="buy:p3")],
-    ]
-    return InlineKeyboardMarkup(kb)
+    ])
 
 def after_pix_keyboard() -> InlineKeyboardMarkup:
-    kb = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Já paguei", callback_data="check:last")],
         [InlineKeyboardButton("⬅️ Voltar", callback_data="back:plans")],
-    ]
-    return InlineKeyboardMarkup(kb)
+    ])
 
 # =========================
 # Handlers
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not BOT_TOKEN or not MP_ACCESS_TOKEN or not VIP_LINK:
-        await update.message.reply_text(
-            "⚠️ O bot não está configurado.\n"
-            "Verifique as variáveis: BOT_TOKEN, MP_ACCESS_TOKEN, VIP_LINK."
-        )
-        return
-
     await update.message.reply_text(
         "👋 Olá! Escolha um plano VIP:",
-        reply_markup=plans_keyboard(),
+        reply_markup=plans_keyboard()
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,34 +192,32 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not exp:
         await update.message.reply_text("❌ Você não tem assinatura ativa.")
         return
-    days_left = int((exp - int(time.time())) / 86400)
+    days_left = max(0, int((exp - int(time.time())) / 86400))
     await update.message.reply_text(f"✅ Assinatura ativa. Expira em ~{days_left} dia(s).")
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    uid = query.from_user.id
-    data = query.data or ""
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    data = q.data or ""
 
     if data == "back:plans":
-        await query.edit_message_text("Escolha um plano VIP:", reply_markup=plans_keyboard())
+        await q.edit_message_text("Escolha um plano VIP:", reply_markup=plans_keyboard())
         return
 
     if data.startswith("buy:"):
         plan_id = data.split(":", 1)[1]
         if plan_id not in PLANS:
-            await query.edit_message_text("Plano inválido.")
+            await q.edit_message_text("Plano inválido.")
             return
 
         plan = PLANS[plan_id]
-        await query.edit_message_text("⏳ Gerando PIX, aguarde...")
+        await q.edit_message_text("⏳ Gerando PIX, aguarde...")
 
         try:
             pix = await mp_create_pix(plan_id=plan_id, user_id=uid)
             set_last_pending(uid, pix["payment_id"], plan_id)
 
-            # mensagem com copia e cola (QR code base64 não dá pra enviar como imagem sem converter)
             text = (
                 f"✅ PIX gerado!\n\n"
                 f"📦 Plano: {plan['name']}\n"
@@ -242,60 +226,59 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"`{pix['qr_code']}`\n\n"
                 f"Depois de pagar, clique em ✅ Já paguei."
             )
-            await query.edit_message_text(text, reply_markup=after_pix_keyboard(), parse_mode="Markdown")
+            await q.edit_message_text(text, reply_markup=after_pix_keyboard(), parse_mode="Markdown")
+
         except Exception as e:
-            await query.edit_message_text(f"❌ Erro ao criar o PIX.\n\n{e}")
+            await q.edit_message_text(f"❌ Erro ao criar o PIX.\n\n{e}")
         return
 
     if data == "check:last":
         pending = get_last_pending(uid)
         if not pending:
-            await query.edit_message_text("❌ Não encontrei um PIX pendente. Gere um novo plano.")
+            await q.edit_message_text("❌ Não encontrei PIX pendente. Gere um novo plano.", reply_markup=plans_keyboard())
             return
 
         payment_id = pending["mp_payment_id"]
         plan_id = pending["plan_id"]
         plan = PLANS.get(plan_id)
 
-        await query.edit_message_text("⏳ Conferindo pagamento no Mercado Pago...")
+        await q.edit_message_text("⏳ Conferindo pagamento...")
 
         try:
             pay = await mp_get_payment(payment_id)
             status = (pay.get("status") or "").lower()
 
             if status == "approved":
-                # ativa assinatura
                 set_subscription_active(uid, plan_id, payment_id, PLANS[plan_id]["days"])
-                await query.edit_message_text(
+                await q.edit_message_text(
                     "✅ Pagamento aprovado!\n\n"
                     f"🎟 Aqui está seu acesso VIP:\n{VIP_LINK}\n\n"
-                    "Se o canal estiver com solicitação para entrar, peça para entrar que eu aprovo automaticamente."
+                    "Se o canal estiver com solicitação para entrar, peça para entrar que eu aprovo automaticamente (se configurado)."
                 )
                 return
 
             if status in ("pending", "in_process"):
-                await query.edit_message_text(
+                await q.edit_message_text(
                     f"⏳ Ainda não aprovado.\nStatus: {status}\n\n"
                     "Espere 1–3 minutos e clique em ✅ Já paguei novamente.",
                     reply_markup=after_pix_keyboard(),
                 )
                 return
 
-            # rejeitado/cancelado/expired etc.
-            await query.edit_message_text(
-                f"❌ Pagamento não aprovado.\nStatus: {status}\n\n"
-                "Gere um novo PIX e tente novamente.",
+            await q.edit_message_text(
+                f"❌ Pagamento não aprovado.\nStatus: {status}\n\nGere um novo PIX e tente novamente.",
                 reply_markup=plans_keyboard(),
             )
+
         except Exception as e:
-            await query.edit_message_text(f"❌ Erro ao consultar o pagamento.\n\n{e}", reply_markup=after_pix_keyboard())
+            await q.edit_message_text(f"❌ Erro ao consultar pagamento.\n\n{e}", reply_markup=after_pix_keyboard())
         return
 
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Se seu canal estiver como "solicitar para entrar",
-    o bot aprova automaticamente quem tiver assinatura ativa.
-    """
+    # Só funciona se CANAL_ID estiver setado e o canal estiver com "Solicitar para entrar"
+    if CANAL_ID is None:
+        return
+
     jr = update.chat_join_request
     uid = jr.from_user.id
 
@@ -311,12 +294,9 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # =========================
-# Main
+# MAIN (corrigido)
 # =========================
-async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN vazio. Configure nas Variables do Railway.")
-
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
@@ -324,12 +304,8 @@ async def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatJoinRequestHandler(on_join_request))
 
-    # POLLING (não use webhook do Telegram aqui)
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    await app.updater.idle()
+    # ✅ Correção definitiva: sem updater.idle()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
