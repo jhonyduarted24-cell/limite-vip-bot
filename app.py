@@ -1,157 +1,386 @@
-import os, sqlite3, uuid
+import os
+import uuid
+import sqlite3
+from typing import Optional, Dict, Any, List
+
 import httpx
-import asyncio
 from fastapi import FastAPI, Request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from fastapi.responses import JSONResponse
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    ChatJoinRequestHandler,
+    ContextTypes,
 )
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CANAL_ID = int(os.environ["CANAL_ID"])
-MP_ACCESS_TOKEN = os.environ["MP_ACCESS_TOKEN"]
-VIP_LINK = os.environ["VIP_LINK"]
+# ==========================
+# CONFIG (edite aqui)
+# ==========================
+# Planos (você pode mudar nomes/valores aqui quando quiser)
+PLANS: List[Dict[str, Any]] = [
+    {"id": "vip_7", "name": "🥉 VIP 7 dias", "price": 19.90},
+    {"id": "vip_30", "name": "🥇 VIP 30 dias", "price": 49.90},
+    {"id": "vip_90", "name": "💎 VIP 90 dias", "price": 99.90},
+]
 
-db = sqlite3.connect("db.sqlite", check_same_thread=False)
-db.execute("""CREATE TABLE IF NOT EXISTS orders (
-    order_id TEXT,
-    user_id INTEGER,
-    payment_id TEXT,
-    status TEXT
-)""")
-db.execute("""CREATE TABLE IF NOT EXISTS join_requests (
-    user_id INTEGER,
-    pending INTEGER
-)""")
-db.commit()
+CURRENCY = "BRL"
 
-app = FastAPI()
-bot = Application.builder().token(BOT_TOKEN).build()
+# Mensagens
+WELCOME_TEXT = (
+    "🔞 *Limite 18 VIP*\n\n"
+    "Escolha um plano abaixo para gerar o PIX.\n"
+    "Depois de pagar, clique em *✅ Já paguei* para liberar o acesso."
+)
 
-# ✅ REGISTRA OS COMANDOS (isso estava faltando)
-# (Essas linhas fazem o /start funcionar)
-# Importante: elas precisam ficar DEPOIS das funções existirem.
-# Então, se der erro, coloque essas 3 linhas lá embaixo, depois das funções.
-# Vou deixar já no lugar correto abaixo (depois das funções).
+# ==========================
+# ENV VARS (obrigatórias)
+# ==========================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "").strip()
+VIP_LINK = os.environ.get("VIP_LINK", "").strip()
 
-async def start(update, context):
-    kb = [[InlineKeyboardButton("💳 Comprar acesso VIP", callback_data="buy")]]
+# Opcional (se você quiser usar depois)
+CANAL_ID = os.environ.get("CANAL_ID", "").strip()  # pode deixar vazio por enquanto
+
+# Railway/Render usa PORT
+PORT = int(os.environ.get("PORT", "8000"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("Faltou BOT_TOKEN nas variáveis do ambiente.")
+if not MP_ACCESS_TOKEN:
+    raise RuntimeError("Faltou MP_ACCESS_TOKEN nas variáveis do ambiente.")
+if not VIP_LINK:
+    raise RuntimeError("Faltou VIP_LINK nas variáveis do ambiente.")
+
+
+# ==========================
+# DB simples (sqlite)
+# ==========================
+DB_PATH = "db.sqlite3"
+
+
+def db_init():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            plan_id TEXT NOT NULL,
+            mp_payment_id TEXT,
+            status TEXT NOT NULL
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+
+def db_set_order(order_id: str, user_id: int, plan_id: str, mp_payment_id: Optional[str], status: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO orders(order_id, user_id, plan_id, mp_payment_id, status)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (order_id, user_id, plan_id, mp_payment_id, status),
+    )
+    con.commit()
+    con.close()
+
+
+def db_get_order(order_id: str) -> Optional[Dict[str, Any]]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    row = cur.execute(
+        "SELECT order_id, user_id, plan_id, mp_payment_id, status FROM orders WHERE order_id=?",
+        (order_id,),
+    ).fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "order_id": row[0],
+        "user_id": row[1],
+        "plan_id": row[2],
+        "mp_payment_id": row[3],
+        "status": row[4],
+    }
+
+
+def db_update_status(order_id: str, status: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE orders SET status=? WHERE order_id=?", (status, order_id))
+    con.commit()
+    con.close()
+
+
+# ==========================
+# Mercado Pago helpers
+# ==========================
+def get_plan(plan_id: str) -> Optional[Dict[str, Any]]:
+    for p in PLANS:
+        if p["id"] == plan_id:
+            return p
+    return None
+
+
+async def mp_create_pix(order_id: str, user_id: int, plan: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Cria um pagamento PIX no Mercado Pago.
+    Retorna json do MP (ou levanta erro).
+    """
+    url = "https://api.mercadopago.com/v1/payments"
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        # ✅ Corrige o erro: nunca pode ser null
+        "X-Idempotency-Key": order_id,
+    }
+
+    payload = {
+        "transaction_amount": float(plan["price"]),
+        "description": f"{plan['name']} - Pedido {order_id}",
+        "payment_method_id": "pix",
+        "payer": {
+            # Mercado Pago aceita email "fake" em muitos casos, mas se sua conta exigir, troque por um válido.
+            "email": f"user{user_id}@example.com",
+        },
+        "external_reference": order_id,
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=headers, json=payload)
+
+    # Mostra erro real
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"MP_ERROR {r.status_code}: {r.text}")
+
+    return r.json()
+
+
+async def mp_get_payment(payment_id: str) -> Dict[str, Any]:
+    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"MP_GET_ERROR {r.status_code}: {r.text}")
+
+    return r.json()
+
+
+def mp_extract_pix_info(mp_json: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Tenta extrair QR e copia/cola.
+    """
+    poi = mp_json.get("point_of_interaction", {}) or {}
+    tx = poi.get("transaction_data", {}) or {}
+
+    qr_code = tx.get("qr_code")
+    qr_code_base64 = tx.get("qr_code_base64")
+
+    # Alguns retornos podem usar outros campos
+    if not qr_code:
+        raise RuntimeError(f"MP_RETURN_NO_QR: {mp_json}")
+
+    return {
+        "qr_code": qr_code,
+        "qr_code_base64": qr_code_base64 or "",
+    }
+
+
+# ==========================
+# Telegram bot
+# ==========================
+application = Application.builder().token(BOT_TOKEN).build()
+
+
+def build_start_keyboard() -> InlineKeyboardMarkup:
+    kb = []
+    for p in PLANS:
+        kb.append([InlineKeyboardButton(f"{p['name']} — R$ {p['price']:.2f}", callback_data=f"buy:{p['id']}")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔞 Acesso ao Canal VIP\n\nPagamento via PIX.",
-        reply_markup=InlineKeyboardMarkup(kb)
+        WELCOME_TEXT,
+        reply_markup=build_start_keyboard(),
+        parse_mode="Markdown",
     )
 
-async def buy(update, context):
+
+async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+    # callback_data = buy:vip_7
+    try:
+        _, plan_id = (q.data or "").split(":", 1)
+    except Exception:
+        await q.edit_message_text("❌ Erro interno (callback inválido).")
+        return
+
+    plan = get_plan(plan_id)
+    if not plan:
+        await q.edit_message_text("❌ Plano não encontrado.")
+        return
 
     user_id = q.from_user.id
     order_id = str(uuid.uuid4())
 
-    db.execute("INSERT INTO orders VALUES (?,?,?,?)",
-               (order_id, user_id, None, "pending"))
-    db.commit()
+    await q.edit_message_text("⏳ Gerando PIX...")
 
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-    payload = {
-        "transaction_amount": 29.90,
-        "description": "Acesso Canal VIP",
-        "payment_method_id": "pix",
-        "payer": {"email": f"user{user_id}@bot.com"},
-        "external_reference": order_id
-    }
+    try:
+        mp_json = await mp_create_pix(order_id=order_id, user_id=user_id, plan=plan)
+        payment_id = str(mp_json.get("id"))
+        pix = mp_extract_pix_info(mp_json)
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "https://api.mercadopago.com/v1/payments",
-            headers=headers,
-            json=payload
+        db_set_order(order_id, user_id, plan_id, payment_id, status="pending")
+
+        msg = (
+            f"✅ *PIX gerado!*\n\n"
+            f"📦 Plano: *{plan['name']}*\n"
+            f"💰 Valor: *R$ {plan['price']:.2f}*\n\n"
+            f"🔑 *Copia e cola (PIX):*\n"
+            f"`{pix['qr_code']}`\n\n"
+            f"Depois de pagar, clique em *✅ Já paguei*."
         )
 
-    # ✅ Se o Mercado Pago devolver erro, mostramos o motivo
-    if r.status_code >= 400:
-        await q.edit_message_text(f"❌ Erro ao criar o PIX.\n\n{r.text[:1500]}")
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ Já paguei", callback_data=f"check:{order_id}")],
+                [InlineKeyboardButton("⬅️ Voltar", callback_data="back:start")],
+            ]
+        )
+
+        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+    except Exception as e:
+        # Mostra o erro real (pra você ajustar rápido)
+        await q.edit_message_text(f"❌ Erro ao criar o PIX.\n\n{str(e)}")
+
+
+async def cb_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    # callback_data = check:<order_id>
+    try:
+        _, order_id = (q.data or "").split(":", 1)
+    except Exception:
+        await q.edit_message_text("❌ Erro interno (check inválido).")
         return
 
-    data = r.json()
+    order = db_get_order(order_id)
+    if not order:
+        await q.edit_message_text("❌ Pedido não encontrado. Gere um PIX novamente com /start.")
+        return
 
-    pix = data["point_of_interaction"]["transaction_data"]["qr_code"]
-    payment_id = data["id"]
-
-    db.execute(
-        "UPDATE orders SET payment_id=? WHERE order_id=?",
-        (payment_id, order_id)
-    )
-    db.commit()
-
-    await q.edit_message_text(
-        f"🧾 Pedido criado\n\n"
-        f"📌 Copie o PIX abaixo e pague:\n\n"
-        f"`{pix}`\n\n"
-        f"Após pagar, aguarde a aprovação automática.",
-        parse_mode="Markdown"
-    )
-
-async def on_join(update, context):
-    user_id = update.chat_join_request.from_user.id
-    db.execute("INSERT OR REPLACE INTO join_requests VALUES (?,1)", (user_id,))
-    db.commit()
-
-# ✅ AGORA SIM: registra handlers (depois das funções existirem)
-bot.add_handler(CommandHandler("start", start))
-bot.add_handler(CallbackQueryHandler(buy, pattern="^buy$"))
-bot.add_handler(ChatJoinRequestHandler(on_join))
-
-
-@app.post("/mp/webhook")
-async def mp_webhook(req: Request):
-    data = await req.json()
-    payment_id = data.get("data", {}).get("id")
-
+    payment_id = order.get("mp_payment_id")
     if not payment_id:
-        return {"ok": True}
+        await q.edit_message_text("❌ Este pedido não tem pagamento associado. Gere novamente com /start.")
+        return
 
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"https://api.mercadopago.com/v1/payments/{payment_id}",
-            headers=headers
-        )
-        payment = r.json()
+    await q.edit_message_text("🔎 Verificando pagamento...")
 
-    if payment.get("status") == "approved":
-        order_id = payment.get("external_reference")
-        user = db.execute(
-            "SELECT user_id FROM orders WHERE order_id=?",
-            (order_id,)
-        ).fetchone()
+    try:
+        mp_json = await mp_get_payment(payment_id)
+        status = (mp_json.get("status") or "").lower()
 
-        if user:
-            user_id = user[0]
-            await bot.bot.send_message(
-                user_id,
-                "✅ Pagamento aprovado!\nClique abaixo para entrar no VIP.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔞 Entrar no VIP", url=VIP_LINK)]
-                ])
+        if status == "approved":
+            db_update_status(order_id, "approved")
+            # Entrega o link VIP
+            msg = (
+                "✅ *Pagamento aprovado!*\n\n"
+                "Aqui está seu acesso VIP:\n"
+                f"{VIP_LINK}\n\n"
+                "⚠️ Se o Telegram pedir, solicite entrada e aguarde aprovação (se seu canal exigir)."
             )
-            await bot.bot.approve_chat_join_request(CANAL_ID, user_id)
+            await q.edit_message_text(msg, parse_mode="Markdown")
+            return
 
+        if status in ("pending", "in_process"):
+            await q.edit_message_text(
+                "⏳ Ainda não aprovado.\n\n"
+                "Se você já pagou, aguarde 1-3 minutos e clique novamente em *✅ Já paguei*.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("✅ Já paguei", callback_data=f"check:{order_id}")]]
+                ),
+            )
+            return
+
+        # Rejected / cancelled / etc
+        await q.edit_message_text(f"❌ Pagamento não aprovado.\nStatus: {status}\n\nGere um novo PIX com /start.")
+
+    except Exception as e:
+        await q.edit_message_text(f"❌ Erro ao verificar pagamento.\n\n{str(e)}")
+
+
+async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=build_start_keyboard())
+
+
+# Handlers
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CallbackQueryHandler(cb_buy, pattern=r"^buy:"))
+application.add_handler(CallbackQueryHandler(cb_check, pattern=r"^check:"))
+application.add_handler(CallbackQueryHandler(cb_back, pattern=r"^back:start$"))
+
+
+# ==========================
+# FastAPI (para Railway Web Service)
+# ==========================
+app = FastAPI()
+
+
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "limite-vip-bot", "status": "running"}
+
+
+@app.get("/health")
+async def health():
     return {"ok": True}
 
 
+# (Opcional) Se você quiser usar webhooks do Mercado Pago depois, dá pra criar endpoint aqui.
+# Por enquanto, não é necessário porque a verificação é pelo botão "Já paguei".
+
+
 @app.on_event("startup")
-async def startup_event():
-    await bot.initialize()
-    await bot.start()
-    await bot.updater.start_polling(drop_pending_updates=True)
+async def on_startup():
+    db_init()
+
+    # ⚠️ Evita erro de "getUpdates conflict" se tiver 2 instâncias:
+    # garanta 1 replica no Railway.
+    await application.initialize()
+    await application.start()
+
+    # polling do bot
+    if application.updater is None:
+        raise RuntimeError("Updater não disponível. Verifique a versão do python-telegram-bot.")
+
+    await application.updater.start_polling(drop_pending_updates=True)
+
 
 @app.on_event("shutdown")
-async def shutdown_event():
-    await bot.updater.stop()
-    await bot.stop()
-    await bot.shutdown()
-
+async def on_shutdown():
+    if application.updater:
+        await application.updater.stop()
+    await application.stop()
+    await application.shutdown()
