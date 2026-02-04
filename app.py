@@ -134,30 +134,33 @@ def get_plan(plan_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def mp_create_pix(order_id: str, user_id: int, plan: Dict[str, Any]) -> Dict[str, Any]:
-    # PIX EMV (aceito por bancos)
-    url = "https://api.mercadopago.com/instore/orders/qr/seller/collectors/me/pos/TelegramPOS/qrs"
+import uuid
+import httpx
+
+MP_ACCESS_TOKEN = os.environ["MP_ACCESS_TOKEN"]
+
+async def mp_create_pix(plan_name: str, price: float, order_id: str) -> dict:
+    url = "https://api.mercadopago.com/instore/orders/qr/seller/collectors/272720107/pos/TelegramPOS/qrs"
 
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Content-Type": "application/json",
-        "X-Idempotency-Key": order_id,
+        # nunca pode ser vazio/nulo:
+        "X-Idempotency-Key": str(uuid.uuid4()),
     }
 
     payload = {
         "external_reference": order_id,
-        "title": plan["name"],
-        "description": f"{plan['name']} - Telegram",
-        "total_amount": float(plan["price"]),
+        "title": plan_name,
+        "description": f"{plan_name} - Telegram",
+        "total_amount": float(price),
         "items": [
             {
-                "title": plan["name"],
-                "description": "Acesso VIP Telegram",
+                "title": plan_name,
                 "quantity": 1,
-                "unit_price": float(plan["price"]),
+                "unit_price": float(price),
             }
         ],
-        "notification_url": "",  # pode deixar vazio por enquanto
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -167,6 +170,7 @@ async def mp_create_pix(order_id: str, user_id: int, plan: Dict[str, Any]) -> Di
         raise RuntimeError(f"MP_ERROR {r.status_code}: {r.text}")
 
     return r.json()
+
 
 
 
